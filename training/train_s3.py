@@ -150,19 +150,23 @@ def create_ffcv_loaders(train_path, val_path, batch_size=512, rank=0, world_size
     IMAGENET_MEAN = np.array([0.485, 0.456, 0.406]) * 255.0
     IMAGENET_STD = np.array([0.229, 0.224, 0.225]) * 255.0
     
-    # Update device assignment to use specific GPU
     device = torch.device(f'cuda:{rank}')
     
-    # Modified pipelines to use specific GPU
+    # Enhanced data augmentation for training
     train_image_pipeline = [
-        RandomResizedCropRGBImageDecoder(output_size=(224,224)),
-        RandomHorizontalFlip(),
+        RandomResizedCropRGBImageDecoder(
+            output_size=(224,224),
+            scale=(0.08, 1.0),  # More aggressive random crop
+            ratio=(3/4, 4/3)
+        ),
+        RandomHorizontalFlip(prob=0.5),
         ToTensor(),
         ToDevice(device, non_blocking=True),
         ToTorchImage(channels_last=True),
         NormalizeImage(IMAGENET_MEAN, IMAGENET_STD, np.float32)
     ]
 
+    # Keep validation pipeline the same
     val_image_pipeline = [
         CenterCropRGBImageDecoder(output_size=(224, 224), ratio=0.8),
         ToTensor(),
@@ -213,17 +217,20 @@ def train_model(rank, world_size, train_loader, val_loader, s3_handler, num_epoc
     """Train model with DDP support"""
     setup_ddp(rank, world_size)
     
-    # Rest of the setup remains similar, but move model to specific GPU
+    # Create model without any modifications
     model = models.resnet50(weights=None)
     model = model.to(rank)
     model = model.to(memory_format=torch.channels_last)
-    
-    # Wrap model with DDP
     model = DDP(model, device_ids=[rank])
     
+    # Keep original training parameters
     scaler = torch.amp.GradScaler(device=f'cuda:{rank}')
     criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
     optimizer = torch.optim.SGD(model.parameters(), lr=0.1, momentum=0.9, weight_decay=1e-4)
+    
+    # Keep original scheduler
+    scheduler = OneCycleLR(optimizer, max_lr=0.1, epochs=num_epochs,
+                          steps_per_epoch=len(train_loader))
     
     # Initialize variables for training
     start_epoch = 0
@@ -241,9 +248,6 @@ def train_model(rank, world_size, train_loader, val_loader, s3_handler, num_epoc
         start_epoch = checkpoint['epoch']
         best_acc = checkpoint.get('best_acc', 0.0)
         print(f"Resuming from epoch {start_epoch} with best accuracy: {best_acc:.2f}%")
-    
-    scheduler = OneCycleLR(optimizer, max_lr=0.1, epochs=num_epochs,
-                          steps_per_epoch=len(train_loader))
     
     model.train()
     model.requires_grad_(True)
