@@ -1,0 +1,8 @@
+
+__pycache__/
+*.pyc 
+*.pth
+data/
+dataset.zip
+train.beton
+val.beton
