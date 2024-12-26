@@ -23,6 +23,14 @@ import sys
 from config import AWS_CONFIG, TRAINING_CONFIG
 from ffcv.transforms import Convert
 from ffcv.transforms import ToTorchImage
+import torch.distributed as dist
+import torch.multiprocessing as mp
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data.distributed import DistributedSampler
+import multiprocessing
+import platform
+import requests
+import subprocess
 
 print(f'Path: {sys.path}\t System version:{sys.version}\t Torch Version: {torch.__version__} \n ffcv version: {ffcv.__version__}')
 
@@ -130,48 +138,52 @@ def write_ffcv_dataset(data_dir, write_path):
         writer.from_indexed_dataset(dataset)
         pbar.update(total)
 
-def create_ffcv_loaders(train_path, val_path, batch_size=512):
-    """Create FFCV data loaders"""
+def setup_ddp(rank, world_size):
+    """Initialize distributed training"""
+    os.environ['MASTER_ADDR'] = 'localhost'
+    os.environ['MASTER_PORT'] = '12355'
+    dist.init_process_group("nccl", rank=rank, world_size=world_size)
+    torch.cuda.set_device(rank)
+
+def create_ffcv_loaders(train_path, val_path, batch_size=512, rank=0, world_size=1):
+    """Create FFCV data loaders with DDP support"""
     IMAGENET_MEAN = np.array([0.485, 0.456, 0.406]) * 255.0
     IMAGENET_STD = np.array([0.229, 0.224, 0.225]) * 255.0
     
-    # Pipeline for training images
+    # Update device assignment to use specific GPU
+    device = torch.device(f'cuda:{rank}')
+    
+    # Modified pipelines to use specific GPU
     train_image_pipeline = [
-        RandomResizedCropRGBImageDecoder(
-            output_size=(224,224),
-            scale=(0.08, 1.0),
-            ratio=(3/4, 4/3)
-        ),
+        RandomResizedCropRGBImageDecoder(output_size=(224,224)),
         RandomHorizontalFlip(),
         ToTensor(),
-        ToDevice(torch.device('cuda:0'), non_blocking=True),
+        ToDevice(device, non_blocking=True),
         ToTorchImage(channels_last=True),
         NormalizeImage(IMAGENET_MEAN, IMAGENET_STD, np.float32)
     ]
 
-    # Pipeline for validation images
     val_image_pipeline = [
-        CenterCropRGBImageDecoder(
-            output_size=(224, 224),
-            ratio=1.0
-        ),
+        CenterCropRGBImageDecoder(output_size=(224, 224), ratio=0.8),
         ToTensor(),
-        ToDevice(torch.device('cuda:0'), non_blocking=True),
+        ToDevice(device, non_blocking=True),
         ToTorchImage(channels_last=True),
         NormalizeImage(IMAGENET_MEAN, IMAGENET_STD, np.float32)
     ]
 
-    # Modified label pipeline to ensure 1D tensor
     label_pipeline = [
         IntDecoder(),
         ToTensor(),
-        ToDevice(torch.device('cuda:0'), non_blocking=True),
-        Convert(torch.long)  # Ensure labels are long tensors
+        ToDevice(device, non_blocking=True),
+        Convert(torch.long)
     ]
+    
+    # Adjust batch size per GPU
+    per_gpu_batch_size = batch_size // world_size if world_size > 1 else batch_size
     
     train_loader = Loader(
         train_path,
-        batch_size=batch_size,
+        batch_size=per_gpu_batch_size,
         num_workers=4,
         order=OrderOption.RANDOM,
         drop_last=True,
@@ -179,37 +191,37 @@ def create_ffcv_loaders(train_path, val_path, batch_size=512):
             'image': train_image_pipeline,
             'label': label_pipeline
         },
-        os_cache=False  # Disable OS cache to reduce memory usage
+        os_cache=False
     )
     
     val_loader = Loader(
         val_path,
-        batch_size=batch_size,
+        batch_size=per_gpu_batch_size,
         num_workers=4,
         order=OrderOption.SEQUENTIAL,
         drop_last=False,
         pipelines={
             'image': val_image_pipeline,
             'label': label_pipeline
-        }
+        },
+        os_cache=False
     )
     
     return train_loader, val_loader
 
-def train_model(train_loader, val_loader, s3_handler, num_epochs=10, resume_path=None, save_freq=2, patience=3):
-    """Train model and save checkpoints to S3"""
-    torch.cuda.empty_cache()
-    os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
+def train_model(rank, world_size, train_loader, val_loader, s3_handler, num_epochs=10, resume_path=None, save_freq=2, patience=3):
+    """Train model with DDP support"""
+    setup_ddp(rank, world_size)
     
-    torch.backends.cudnn.benchmark = True
-    torch.backends.cuda.matmul.allow_tf32 = True
-    torch.backends.cudnn.allow_tf32 = True
-    
+    # Rest of the setup remains similar, but move model to specific GPU
     model = models.resnet50(weights=None)
-    model = model.cuda()
+    model = model.to(rank)
     model = model.to(memory_format=torch.channels_last)
     
-    scaler = torch.amp.GradScaler(device='cuda')
+    # Wrap model with DDP
+    model = DDP(model, device_ids=[rank])
+    
+    scaler = torch.amp.GradScaler(device=f'cuda:{rank}')
     criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
     optimizer = torch.optim.SGD(model.parameters(), lr=0.1, momentum=0.9, weight_decay=1e-4)
     
@@ -333,41 +345,122 @@ def train_model(train_loader, val_loader, s3_handler, num_epochs=10, resume_path
     torch.save(checkpoint, 'final_model.pth')
     s3_handler.upload_model('final_model.pth', 'models/final_model.pth')
 
+    dist.destroy_process_group()
+
+def print_system_info():
+    print("\nSystem Information:")
+    
+    # Get AWS instance information
+    try:
+        # Get instance type from AWS metadata
+        instance_response = requests.get("http://169.254.169.254/latest/meta-data/instance-type", timeout=2)
+        instance_type = instance_response.text
+        print(f"AWS Instance Type: {instance_type}")
+    except:
+        print("Could not determine AWS instance type")
+    
+    # Get GPU information using nvidia-smi
+    try:
+        nvidia_smi = subprocess.check_output("nvidia-smi", shell=True)
+        print("\nNVIDIA-SMI Output:")
+        print(nvidia_smi.decode('utf-8'))
+    except:
+        print("nvidia-smi command failed")
+
+    print(f"Python Version: {platform.python_version()}")
+    print(f"PyTorch Version: {torch.__version__}")
+    print(f"FFCV Version: {ffcv.__version__}")
+    print(f"CPU Cores: {multiprocessing.cpu_count()}")
+    print(f"CUDA Available: {torch.cuda.is_available()}")
+    if torch.cuda.is_available():
+        print(f"CUDA Version: {torch.version.cuda}")
+        print(f"cuDNN Version: {torch.backends.cudnn.version()}")
+        print("\nPyTorch GPU Detection:")
+        print(f"Number of GPUs (torch.cuda.device_count): {torch.cuda.device_count()}")
+        for i in range(torch.cuda.device_count()):
+            print(f"GPU {i}: {torch.cuda.get_device_name(i)}")
+    print(f"System Path: {sys.path}\n")
+
 def main():
     try:
+        # Print system information
+        print_system_info()
+
+        # Check CUDA availability first
+        if not torch.cuda.is_available():
+            print("CUDA is not available. Running on CPU only.")
+            return
+
+        # Get GPU information
+        gpu_count = torch.cuda.device_count()
+        print(f"GPU Information:")
+        print(f"Number of GPUs detected: {gpu_count}")
+        for i in range(gpu_count):
+            gpu_name = torch.cuda.get_device_name(i)
+            gpu_memory = torch.cuda.get_device_properties(i).total_memory / 1024**3  # Convert to GB
+            print(f"GPU {i}: {gpu_name} ({gpu_memory:.2f} GB)")
+        
+        # Print worker information
+        num_workers = min(multiprocessing.cpu_count(), 8)  # Usually good to limit to 8
+        print(f"\nWorker Information:")
+        print(f"CPU Cores Available: {multiprocessing.cpu_count()}")
+        print(f"Number of workers to be used: {num_workers}")
+        print()
+
         s3_handler = S3Handler()
         
-        # Optional: Specify resume path
-        resume_path = None  # or 'path/to/checkpoint.pth'
-        
-        # Download dataset from S3
-        s3_handler.download_dataset('archive.zip', 'dataset.zip')
-        
-        # Prepare data with 80/20 split
-        train_dir, val_dir = prepare_data('dataset.zip', 'data')
-        
-        # Convert to FFCV format
-        write_ffcv_dataset(train_dir, 'train.beton')
-        write_ffcv_dataset(val_dir, 'val.beton')
-        
-        # Create data loaders with larger batch size for g6.2xlarge
-        train_loader, val_loader = create_ffcv_loaders(
-            'train.beton', 
-            'val.beton', 
-            batch_size=TRAINING_CONFIG['batch_size']
-        )
-        
-        # Train model with new parameters
-        train_model(
-            train_loader, 
-            val_loader, 
-            s3_handler,
-            num_epochs=10,
-            resume_path=resume_path,
-            save_freq=2,  # Save every 2 epochs
-            patience=3    # Early stopping patience
-        )
-        
+        if gpu_count > 1:
+            print(f"Multiple GPUs detected! Using DistributedDataParallel for training across {gpu_count} GPUs.")
+            
+            # Download and prepare data first
+            s3_handler.download_dataset('train_archive.zip', 'dataset.zip')
+            train_dir, val_dir = prepare_data('dataset.zip', 'data')
+            write_ffcv_dataset(train_dir, 'train.beton')
+            write_ffcv_dataset(val_dir, 'val.beton')
+            
+            # Launch distributed training
+            mp.spawn(
+                train_model,
+                args=(
+                    gpu_count,  # world_size = number of GPUs
+                    'train.beton',
+                    'val.beton',
+                    s3_handler,
+                    TRAINING_CONFIG['num_epochs'],
+                    None,  # resume_path
+                    2,     # save_freq
+                    3      # patience
+                ),
+                nprocs=gpu_count,
+                join=True
+            )
+        else:
+            print("Single GPU detected. Running without distributed training.")
+            # Single GPU training path
+            s3_handler.download_dataset('train_archive.zip', 'dataset.zip')
+            train_dir, val_dir = prepare_data('dataset.zip', 'data')
+            write_ffcv_dataset(train_dir, 'train.beton')
+            write_ffcv_dataset(val_dir, 'val.beton')
+            
+            # Create data loaders for single GPU
+            train_loader, val_loader = create_ffcv_loaders(
+                'train.beton', 
+                'val.beton', 
+                batch_size=TRAINING_CONFIG['batch_size']
+            )
+            
+            # Train on single GPU
+            train_model(
+                0,              # rank
+                1,              # world_size
+                train_loader,
+                val_loader,
+                s3_handler,
+                num_epochs=TRAINING_CONFIG['num_epochs'],
+                save_freq=2,
+                patience=3
+            )
+
     finally:
         # Cleanup temporary files
         for file in ['dataset.zip', 'train.beton', 'val.beton']:
