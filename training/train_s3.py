@@ -196,12 +196,9 @@ def create_ffcv_loaders(train_path, val_path, batch_size=512):
     
     return train_loader, val_loader
 
-def train_model(train_loader, val_loader, s3_handler, num_epochs=40):
+def train_model(train_loader, val_loader, s3_handler, num_epochs=10, resume_path=None, save_freq=2, patience=3):
     """Train model and save checkpoints to S3"""
-    # Memory optimization
     torch.cuda.empty_cache()
-    
-    # Set memory allocation config
     os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
     
     torch.backends.cudnn.benchmark = True
@@ -212,34 +209,45 @@ def train_model(train_loader, val_loader, s3_handler, num_epochs=40):
     model = model.cuda()
     model = model.to(memory_format=torch.channels_last)
     
-    # Use new GradScaler API
     scaler = torch.amp.GradScaler(device='cuda')
-    
     criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
     optimizer = torch.optim.SGD(model.parameters(), lr=0.1, momentum=0.9, weight_decay=1e-4)
     
-    # Gradient checkpointing to save memory
+    # Initialize variables for training
+    start_epoch = 0
+    best_acc = 0.0
+    patience_counter = 0
+    best_loss = float('inf')
+    
+    # Resume training if checkpoint provided
+    if resume_path:
+        print(f"Resuming from checkpoint: {resume_path}")
+        checkpoint = torch.load(resume_path)
+        model.load_state_dict(checkpoint['model_state_dict'])
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        scaler.load_state_dict(checkpoint['scaler_state_dict'])
+        start_epoch = checkpoint['epoch']
+        best_acc = checkpoint.get('best_acc', 0.0)
+        print(f"Resuming from epoch {start_epoch} with best accuracy: {best_acc:.2f}%")
+    
+    scheduler = OneCycleLR(optimizer, max_lr=0.1, epochs=num_epochs,
+                          steps_per_epoch=len(train_loader))
+    
     model.train()
     model.requires_grad_(True)
     
-    scheduler = OneCycleLR(optimizer, max_lr=0.3, epochs=num_epochs,
-                          steps_per_epoch=len(train_loader))
-    
-    best_acc = 0.0
-    for epoch in range(num_epochs):
+    for epoch in range(start_epoch, num_epochs):
         # Training
         model.train()
         train_loss = 0
         correct = 0
         total = 0
         
-        pbar = tqdm(train_loader, desc=f'Epoch {epoch+1}/{num_epochs}')
+        pbar = tqdm(train_loader, desc=f'Epoch {epoch+1}/{num_epochs} [Train]')
         for i, (images, labels) in enumerate(pbar):
-            # Clear cache periodically
             if i % 10 == 0:
                 torch.cuda.empty_cache()
             
-            # Ensure labels are 1D
             labels = labels.squeeze()
                 
             with torch.amp.autocast('cuda'):
@@ -247,12 +255,9 @@ def train_model(train_loader, val_loader, s3_handler, num_epochs=40):
                 loss = criterion(outputs, labels)
             
             scaler.scale(loss).backward()
-            # Step the optimizer first
             scaler.step(optimizer)
             scaler.update()
             optimizer.zero_grad(set_to_none=True)
-            
-            # Then step the scheduler
             scheduler.step()
             
             train_loss += loss.item()
@@ -260,7 +265,10 @@ def train_model(train_loader, val_loader, s3_handler, num_epochs=40):
             total += labels.size(0)
             correct += predicted.eq(labels).sum().item()
             
-            pbar.set_postfix({'loss': train_loss/(i+1), 'acc': 100.*correct/total})
+            pbar.set_postfix({
+                'loss': train_loss/(i+1), 
+                'acc': f'{100.*correct/total:.2f}%'
+            })
         
         # Validation
         model.eval()
@@ -268,9 +276,9 @@ def train_model(train_loader, val_loader, s3_handler, num_epochs=40):
         correct = 0
         total = 0
         
+        val_pbar = tqdm(val_loader, desc=f'Epoch {epoch+1}/{num_epochs} [Val]')
         with torch.no_grad():
-            for images, labels in val_loader:
-                # Add squeeze for validation labels too
+            for images, labels in val_pbar:
                 labels = labels.squeeze()
                 
                 outputs = model(images)
@@ -280,29 +288,46 @@ def train_model(train_loader, val_loader, s3_handler, num_epochs=40):
                 _, predicted = outputs.max(1)
                 total += labels.size(0)
                 correct += predicted.eq(labels).sum().item()
+                
+                val_pbar.set_postfix({
+                    'loss': val_loss/(total/labels.size(0)), 
+                    'acc': f'{100.*correct/total:.2f}%'
+                })
         
         val_acc = 100.*correct/total
-        print(f'Validation Accuracy: {val_acc:.2f}%')
+        avg_val_loss = val_loss/len(val_loader)
+        print(f'Validation Accuracy: {val_acc:.2f}% | Loss: {avg_val_loss:.4f}')
         
-        # Save checkpoint
+        # Create checkpoint dictionary
         checkpoint = {
             'epoch': epoch + 1,
             'model_state_dict': model.state_dict(),
             'optimizer_state_dict': optimizer.state_dict(),
             'scheduler_state_dict': scheduler.state_dict(),
             'scaler_state_dict': scaler.state_dict(),
-            'val_acc': val_acc
+            'val_acc': val_acc,
+            'best_acc': best_acc
         }
         
-        # Save to local then upload to S3
-        torch.save(checkpoint, f'checkpoint_epoch{epoch+1}.pth')
-        s3_handler.upload_model(f'checkpoint_epoch{epoch+1}.pth', 
-                              f'models/checkpoints/checkpoint_epoch{epoch+1}.pth')
+        # Save checkpoint based on save_freq
+        if (epoch + 1) % save_freq == 0:
+            torch.save(checkpoint, f'checkpoint_epoch{epoch+1}.pth')
+            s3_handler.upload_model(f'checkpoint_epoch{epoch+1}.pth', 
+                                  f'models/checkpoints/checkpoint_epoch{epoch+1}.pth')
         
+        # Save best model and check for early stopping
         if val_acc > best_acc:
             best_acc = val_acc
+            patience_counter = 0
             torch.save(checkpoint, 'best_model.pth')
             s3_handler.upload_model('best_model.pth', 'models/best_model.pth')
+        else:
+            patience_counter += 1
+        
+        # Early stopping
+        if patience_counter >= patience:
+            print(f'\nEarly stopping triggered after {epoch + 1} epochs')
+            break
     
     # Save final model
     torch.save(checkpoint, 'final_model.pth')
@@ -310,8 +335,10 @@ def train_model(train_loader, val_loader, s3_handler, num_epochs=40):
 
 def main():
     try:
-        # Simple initialization using config
         s3_handler = S3Handler()
+        
+        # Optional: Specify resume path
+        resume_path = None  # or 'path/to/checkpoint.pth'
         
         # Download dataset from S3
         s3_handler.download_dataset('archive.zip', 'dataset.zip')
@@ -330,8 +357,16 @@ def main():
             batch_size=TRAINING_CONFIG['batch_size']
         )
         
-        # Train model
-        train_model(train_loader, val_loader, s3_handler)
+        # Train model with new parameters
+        train_model(
+            train_loader, 
+            val_loader, 
+            s3_handler,
+            num_epochs=10,
+            resume_path=resume_path,
+            save_freq=2,  # Save every 2 epochs
+            patience=3    # Early stopping patience
+        )
         
     finally:
         # Cleanup temporary files
