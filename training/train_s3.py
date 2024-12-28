@@ -31,6 +31,7 @@ import multiprocessing
 import platform
 import requests
 import subprocess
+from lr_finder import LRFinder
 
 print(f'Path: {sys.path}\t System version:{sys.version}\t Torch Version: {torch.__version__} \n ffcv version: {ffcv.__version__}')
 
@@ -223,7 +224,12 @@ def train_model(rank, world_size, train_loader, val_loader, s3_handler, num_epoc
     
     scaler = torch.amp.GradScaler(device=f'cuda:{rank}')
     criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
-    optimizer = torch.optim.SGD(model.parameters(), lr=0.1, momentum=0.9, weight_decay=1e-4)
+    optimizer = torch.optim.SGD(
+        model.parameters(), 
+        lr=TRAINING_CONFIG.get('learning_rate', 0.1),  # Use found LR or default to 0.1
+        momentum=0.9, 
+        weight_decay=1e-4
+    )
     
     # Initialize variables for training
     start_epoch = 0
@@ -381,53 +387,80 @@ def print_system_info():
             print(f"GPU {i}: {torch.cuda.get_device_name(i)}")
     print(f"System Path: {sys.path}\n")
 
+def find_lr(model, train_loader, criterion, device):
+    """Performs the learning rate range test"""
+    optimizer = torch.optim.SGD(model.parameters(), lr=1e-7, momentum=0.9, weight_decay=1e-4)
+    lr_finder = LRFinder(model, optimizer, criterion, device=device)
+    
+    print("Running learning rate range test...")
+    lr_finder.range_test(train_loader, start_lr=1e-7, end_lr=10, num_iter=100, step_mode="exp")
+    
+    # Plot the results
+    lr_finder.plot(skip_start=10, skip_end=5)
+    
+    # Get the suggested learning rate
+    suggested_lr = lr_finder.get_suggested_lr()
+    
+    # Reset the model and optimizer to their initial states
+    lr_finder.reset()
+    
+    return suggested_lr
+
 def main():
     try:
         # Print system information
         print_system_info()
 
-        # Check CUDA availability first
+        # Initialize S3 handler
+        s3_handler = S3Handler()
+
+        # Add checkpoint handling
+        resume_checkpoint = None
+        if len(sys.argv) > 1 and sys.argv[1] == '--resume':
+            if len(sys.argv) > 2:
+                checkpoint_path = sys.argv[2]
+                # Download checkpoint from S3 if it starts with 's3://'
+                if checkpoint_path.startswith('s3://'):
+                    local_checkpoint_path = 'downloaded_checkpoint.pth'
+                    # Extract bucket and key from s3:// URL
+                    _, _, bucket_key = checkpoint_path.partition('s3://')
+                    bucket, key = bucket_key.split('/', 1)
+                    print(f"Downloading checkpoint from S3: {checkpoint_path}")
+                    s3_handler.s3.download_file(bucket, key, local_checkpoint_path)
+                    resume_checkpoint = local_checkpoint_path
+                else:
+                    resume_checkpoint = checkpoint_path
+                print(f"Resuming from checkpoint: {resume_checkpoint}")
+            else:
+                print("Error: Please provide checkpoint path when using --resume")
+                return
+
+        # Rest of your existing setup code...
         if not torch.cuda.is_available():
             print("CUDA is not available. Running on CPU only.")
             return
 
-        # Get GPU information
         gpu_count = torch.cuda.device_count()
-        print(f"GPU Information:")
-        print(f"Number of GPUs detected: {gpu_count}")
-        for i in range(gpu_count):
-            gpu_name = torch.cuda.get_device_name(i)
-            gpu_memory = torch.cuda.get_device_properties(i).total_memory / 1024**3  # Convert to GB
-            print(f"GPU {i}: {gpu_name} ({gpu_memory:.2f} GB)")
-        
-        # Print worker information
-        num_workers = min(multiprocessing.cpu_count(), 8)  # Usually good to limit to 8
-        print(f"\nWorker Information:")
-        print(f"CPU Cores Available: {multiprocessing.cpu_count()}")
-        print(f"Number of workers to be used: {num_workers}")
-        print()
+        # ... (your existing GPU info printing code)
 
-        s3_handler = S3Handler()
-        
-        if gpu_count > 1:
-            print(f"Multiple GPUs detected! Using DistributedDataParallel for training across {gpu_count} GPUs.")
-            
-            # Download and prepare data first
+        # Download and prepare data if not already present
+        if not os.path.exists('train.beton') or not os.path.exists('val.beton'):
             s3_handler.download_dataset('train_archive.zip', 'dataset.zip')
             train_dir, val_dir = prepare_data('dataset.zip', 'data')
             write_ffcv_dataset(train_dir, 'train.beton')
             write_ffcv_dataset(val_dir, 'val.beton')
-            
-            # Launch distributed training
+
+        if gpu_count > 1:
+            print(f"Multiple GPUs detected! Using DistributedDataParallel across {gpu_count} GPUs.")
             mp.spawn(
                 train_model,
                 args=(
-                    gpu_count,  # world_size = number of GPUs
+                    gpu_count,
                     'train.beton',
                     'val.beton',
                     s3_handler,
                     TRAINING_CONFIG['num_epochs'],
-                    None,  # resume_path
+                    resume_checkpoint,  # Pass the checkpoint path
                     2,     # save_freq
                     3      # patience
                 ),
@@ -436,20 +469,33 @@ def main():
             )
         else:
             print("Single GPU detected. Running without distributed training.")
-            # Single GPU training path
-            s3_handler.download_dataset('train_archive.zip', 'dataset.zip')
-            train_dir, val_dir = prepare_data('dataset.zip', 'data')
-            write_ffcv_dataset(train_dir, 'train.beton')
-            write_ffcv_dataset(val_dir, 'val.beton')
             
-            # Create data loaders for single GPU
+            # Create model and move to GPU
+            model = models.resnet50(weights=None)
+            model = model.to(0)
+            model = model.to(memory_format=torch.channels_last)
+            
+            # Create data loaders
             train_loader, val_loader = create_ffcv_loaders(
                 'train.beton', 
                 'val.beton', 
                 batch_size=TRAINING_CONFIG['batch_size']
             )
             
-            # Train on single GPU
+            # Add LR finder before training if not resuming
+            if resume_checkpoint is None:
+                criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
+                suggested_lr = find_lr(model, train_loader, criterion, device=torch.device('cuda:0'))
+                print(f"Suggested learning rate: {suggested_lr}")
+                
+                # Upload the LR finder plot to S3
+                if os.path.exists('lr_finder_plot.png'):
+                    s3_handler.upload_model('lr_finder_plot.png', 'training_artifacts/lr_finder_plot.png')
+                
+                # Update the learning rate in your training configuration
+                TRAINING_CONFIG['learning_rate'] = suggested_lr
+            
+            # Continue with your existing training code...
             train_model(
                 0,              # rank
                 1,              # world_size
@@ -457,13 +503,14 @@ def main():
                 val_loader,
                 s3_handler,
                 num_epochs=TRAINING_CONFIG['num_epochs'],
+                resume_path=resume_checkpoint,
                 save_freq=2,
                 patience=3
             )
 
     finally:
         # Cleanup temporary files
-        for file in ['dataset.zip', 'train.beton', 'val.beton']:
+        for file in ['dataset.zip', 'downloaded_checkpoint.pth', 'lr_finder_plot.png']:
             if os.path.exists(file):
                 os.remove(file)
         if os.path.exists('data'):
