@@ -34,6 +34,9 @@ import subprocess
 from lr_finder import LRFinder
 import logging
 from datetime import datetime
+import math
+import time
+from botocore.exceptions import ClientError
 
 print(f'Path: {sys.path}\t System version:{sys.version}\t Torch Version: {torch.__version__} \n ffcv version: {ffcv.__version__}')
 
@@ -43,7 +46,13 @@ class S3Handler:
             's3',
             aws_access_key_id=AWS_CONFIG['access_key_id'],
             aws_secret_access_key=AWS_CONFIG['secret_access_key'],
-            region_name=AWS_CONFIG['region_name']
+            region_name=AWS_CONFIG['region_name'],
+            config=boto3.session.Config(
+                max_pool_connections=50,
+                retries={'max_attempts': 5},
+                connect_timeout=60,
+                read_timeout=60
+            )
         )
         self.bucket = AWS_CONFIG['bucket_name']
     
@@ -63,23 +72,94 @@ class S3Handler:
             raise
     
     def upload_model(self, local_path, s3_key):
-        """Upload artifacts to S3"""
+        """Upload artifacts to S3 with better error handling"""
         try:
             print(f"Uploading to S3: s3://{self.bucket}/{s3_key}")
-            # Create directory structure in S3 if needed
-            directory = os.path.dirname(s3_key)
-            if directory:
-                # Check if directory exists in S3
-                try:
-                    self.s3.head_object(Bucket=self.bucket, Key=f"{directory}/")
-                except:
-                    # Create empty directory marker
-                    self.s3.put_object(Bucket=self.bucket, Key=f"{directory}/")
             
-            self.s3.upload_file(local_path, self.bucket, s3_key)
+            # Verify file exists and is readable
+            if not os.path.exists(local_path):
+                raise FileNotFoundError(f"Local file not found: {local_path}")
+            
+            # Get file size
+            file_size = os.path.getsize(local_path)
+            
+            # For large files, use multipart upload
+            if file_size > 100 * 1024 * 1024:  # 100MB
+                self._multipart_upload(local_path, s3_key)
+            else:
+                # For smaller files, use single upload with ExtraArgs
+                with open(local_path, 'rb') as data:
+                    self.s3.upload_fileobj(
+                        data, 
+                        self.bucket, 
+                        s3_key,
+                        ExtraArgs={
+                            'StorageClass': 'STANDARD',
+                            'ContentType': 'application/octet-stream'
+                        }
+                    )
+            
+            print(f"Successfully uploaded {local_path} to s3://{self.bucket}/{s3_key}")
+            
         except Exception as e:
             print(f"Error uploading to S3: {str(e)}")
-            raise
+            # Don't raise the exception to prevent training interruption
+            return False
+        return True
+    
+    def _multipart_upload(self, local_path, s3_key):
+        """Handle multipart upload for large files"""
+        # Initialize multipart upload
+        mpu = self.s3.create_multipart_upload(
+            Bucket=self.bucket,
+            Key=s3_key,
+            StorageClass='STANDARD',
+            ContentType='application/octet-stream'
+        )
+        
+        try:
+            # Chunk size of 100MB
+            chunk_size = 100 * 1024 * 1024
+            file_size = os.path.getsize(local_path)
+            chunks = int(math.ceil(file_size / chunk_size))
+            
+            parts = []
+            
+            with open(local_path, 'rb') as f:
+                for i in range(chunks):
+                    data = f.read(chunk_size)
+                    part = self.s3.upload_part(
+                        Bucket=self.bucket,
+                        Key=s3_key,
+                        PartNumber=i + 1,
+                        UploadId=mpu['UploadId'],
+                        Body=data
+                    )
+                    
+                    parts.append({
+                        'PartNumber': i + 1,
+                        'ETag': part['ETag']
+                    })
+            
+            # Complete multipart upload
+            self.s3.complete_multipart_upload(
+                Bucket=self.bucket,
+                Key=s3_key,
+                UploadId=mpu['UploadId'],
+                MultipartUpload={'Parts': parts}
+            )
+            
+        except Exception as e:
+            print(f"Error in multipart upload: {str(e)}")
+            # Abort the multipart upload
+            self.s3.abort_multipart_upload(
+                Bucket=self.bucket,
+                Key=s3_key,
+                UploadId=mpu['UploadId']
+            )
+            return False
+        
+        return True
 
 def extract_chunk(args):
     """Extract a chunk of files from zip archive"""
@@ -567,7 +647,7 @@ def train_model(rank, world_size, train_path, val_path, num_epochs=40, resume_pa
             
             if not scaler.step(optimizer):
                 amp_stats['overflow_count'] += 1
-                logger.warning(f"Gradient overflow detected (count: {amp_stats['overflow_count']})")
+                # logger.warning(f"Gradient overflow detected (count: {amp_stats['overflow_count']})")
             
             scaler.update()
             optimizer.zero_grad(set_to_none=True)
@@ -652,8 +732,18 @@ def train_model(rank, world_size, train_path, val_path, num_epochs=40, resume_pa
         if val_acc > best_acc:
             best_acc = val_acc
             patience_counter = 0
-            torch.save(checkpoint, 'best_model.pth')
-            s3_handler.upload_model('best_model.pth', 'models/best_model.pth')
+            
+            # Save model locally first
+            save_path = 'best_model.pth'
+            try:
+                torch.save(checkpoint, save_path)
+                # Only upload if save was successful
+                if os.path.exists(save_path):
+                    if not s3_handler.upload_model(save_path, 'models/best_model.pth'):
+                        print("Warning: Failed to upload model to S3, but continuing training")
+            except Exception as e:
+                print(f"Error saving model: {e}")
+                # Continue training even if save fails
         else:
             patience_counter += 1
         
