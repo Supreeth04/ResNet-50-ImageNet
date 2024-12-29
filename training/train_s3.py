@@ -32,6 +32,8 @@ import platform
 import requests
 import subprocess
 from lr_finder import LRFinder
+import logging
+from datetime import datetime
 
 print(f'Path: {sys.path}\t System version:{sys.version}\t Torch Version: {torch.__version__} \n ffcv version: {ffcv.__version__}')
 
@@ -46,98 +48,300 @@ class S3Handler:
         self.bucket = AWS_CONFIG['bucket_name']
     
     def download_dataset(self, s3_key, local_path):
+        """Download a file from S3"""
         print(f"Downloading from S3: s3://{self.bucket}/{s3_key}")
-        self.s3.download_file(self.bucket, s3_key, local_path)
+        try:
+            # Create directory if local_path contains a directory structure
+            directory = os.path.dirname(local_path)
+            if directory:  # Only create directory if there's a path
+                os.makedirs(directory, exist_ok=True)
+                
+            self.s3.download_file(self.bucket, s3_key, local_path)
+        except Exception as e:
+            print(f"Error downloading from S3: {str(e)}")
+            print(f"Attempted to download from: s3://{self.bucket}/{s3_key}")
+            raise
     
     def upload_model(self, local_path, s3_key):
-        """Upload model artifacts to S3 with organized structure"""
-        s3_path = f'model_artifacts/{s3_key}'  # Organize in model_artifacts folder
-        print(f"Uploading to S3: s3://{self.bucket}/{s3_path}")
-        self.s3.upload_file(local_path, self.bucket, s3_path)
+        """Upload artifacts to S3"""
+        try:
+            print(f"Uploading to S3: s3://{self.bucket}/{s3_key}")
+            # Create directory structure in S3 if needed
+            directory = os.path.dirname(s3_key)
+            if directory:
+                # Check if directory exists in S3
+                try:
+                    self.s3.head_object(Bucket=self.bucket, Key=f"{directory}/")
+                except:
+                    # Create empty directory marker
+                    self.s3.put_object(Bucket=self.bucket, Key=f"{directory}/")
+            
+            self.s3.upload_file(local_path, self.bucket, s3_key)
+        except Exception as e:
+            print(f"Error uploading to S3: {str(e)}")
+            raise
 
-def prepare_data(zip_path, data_dir):
-    """Unzip and split data into train/val"""
-    # Unzip dataset
+def extract_chunk(args):
+    """Extract a chunk of files from zip archive"""
+    zip_path, chunk_files, temp_dir = args
+    with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+        for file in chunk_files:
+            zip_ref.extract(file, temp_dir)
+
+def prepare_data(zip_path, data_dir, s3_handler=None):
+    """Unzip and prepare ImageNet data with caching support"""
+    cache_dir = os.path.join(data_dir, 'processed_cache')
+    os.makedirs(cache_dir, exist_ok=True)
+    
+    # Check if processed data exists in cache
+    train_cache = os.path.join(cache_dir, 'train')
+    val_cache = os.path.join(cache_dir, 'val')
+    
+    # Try to download cached data from S3 first
+    if s3_handler:
+        try:
+            print("Checking for cached data in S3...")
+            s3_handler.download_dataset('processed_data/train.tar', f'{train_cache}.tar')
+            s3_handler.download_dataset('processed_data/val.tar', f'{val_cache}.tar')
+            
+            # Extract cached data
+            print("Extracting cached data...")
+            subprocess.run(['tar', '-xf', f'{train_cache}.tar', '-C', cache_dir])
+            subprocess.run(['tar', '-xf', f'{val_dir}.tar', '-C', cache_dir])
+            
+            print("Using cached data from S3")
+            return train_cache, val_cache
+            
+        except Exception as e:
+            print(f"No cached data found in S3 or error downloading: {e}")
+            print("Processing from scratch...")
+    
+    # If no cached data, process from scratch
+    temp_dir = os.path.join(data_dir, 'temp')
+    os.makedirs(temp_dir, exist_ok=True)
+    
     print("Unzipping dataset...")
     with zipfile.ZipFile(zip_path, 'r') as zip_ref:
-        files = zip_ref.namelist()
-        for file in tqdm(files, desc="Extracting files"):
-            zip_ref.extract(file, data_dir)
+        zip_ref.extractall(temp_dir)
     
-    # Get all image paths and labels
-    dataset = ImageFolder(os.path.join(data_dir, os.listdir(data_dir)[0]))
-    images = [x[0] for x in dataset.samples]
-    labels = [x[1] for x in dataset.samples]
+    # Set up paths based on your dataset structure
+    data_root = os.path.join(temp_dir, 'Data', 'CLS-LOC')
+    train_path = os.path.join(data_root, 'train')
+    val_path = os.path.join(data_root, 'val')
     
-    # Count samples per class
-    from collections import Counter
-    label_counts = Counter(labels)
-    print(f"Class distribution: {label_counts}")
+    # Load class mapping
+    synset_mapping = {}
+    mapping_file = os.path.join(temp_dir, 'LOC_synset_mapping.txt')
+    with open(mapping_file, 'r') as f:
+        for line in f:
+            synset, label = line.strip().split(' ', 1)
+            synset_mapping[synset] = label
     
-    # Filter out classes with less than 2 samples
-    valid_classes = [cls for cls, count in label_counts.items() if count >= 2]
-    print(f"Number of valid classes (with >=2 samples): {len(valid_classes)}")
-    
-    # Filter dataset to only include valid classes
-    valid_indices = [i for i, label in enumerate(labels) if label in valid_classes]
-    filtered_images = [images[i] for i in valid_indices]
-    filtered_labels = [labels[i] for i in valid_indices]
-    
-    # Remap labels to be consecutive integers starting from 0
-    label_map = {old: new for new, old in enumerate(sorted(valid_classes))}
-    filtered_labels = [label_map[label] for label in filtered_labels]
-    
-    print(f"Total samples after filtering: {len(filtered_images)}")
-    
-    # Split into train/val
-    train_imgs, val_imgs, train_labels, val_labels = train_test_split(
-        filtered_images, filtered_labels, test_size=0.2, 
-        stratify=filtered_labels, random_state=42
-    )
-    
-    # Create train/val directories
-    train_dir = os.path.join(data_dir, 'train')
-    val_dir = os.path.join(data_dir, 'val')
+    # Create destination directories
+    train_dir = os.path.join(cache_dir, 'train')
+    val_dir = os.path.join(cache_dir, 'val')
     os.makedirs(train_dir, exist_ok=True)
     os.makedirs(val_dir, exist_ok=True)
     
-    # Move files to respective directories with progress bars
-    print("Preparing training data...")
-    for img, label in tqdm(zip(train_imgs, train_labels), total=len(train_imgs), desc="Copying training files"):
-        target_dir = os.path.join(train_dir, str(label))
-        os.makedirs(target_dir, exist_ok=True)
-        shutil.copy2(img, target_dir)
+    # Process training data
+    print("Processing training data...")
+    for synset in tqdm(os.listdir(train_path)):
+        src_dir = os.path.join(train_path, synset)
+        dst_dir = os.path.join(train_dir, synset)
+        if os.path.isdir(src_dir):
+            shutil.copytree(src_dir, dst_dir, dirs_exist_ok=True)
     
-    print("Preparing validation data...")
-    for img, label in tqdm(zip(val_imgs, val_labels), total=len(val_imgs), desc="Copying validation files"):
-        target_dir = os.path.join(val_dir, str(label))
-        os.makedirs(target_dir, exist_ok=True)
-        shutil.copy2(img, target_dir)
+    # Process validation data
+    print("Processing validation data...")
+    val_annotations = {}
     
-    # Save label mapping for reference
-    import json
-    with open(os.path.join(data_dir, 'label_mapping.json'), 'w') as f:
-        json.dump(label_map, f, indent=2)
+    # Read validation ground truth
+    val_ground_truth = os.path.join(temp_dir, 'LOC_val_solution.csv')
+    if os.path.exists(val_ground_truth):
+        print("Using validation ground truth file...")
+        with open(val_ground_truth, 'r') as f:
+            next(f)  # Skip header
+            for line in f:
+                parts = line.strip().split(',')
+                if len(parts) >= 2:
+                    img_name = parts[0]
+                    # Extract synset from the annotation format
+                    synset = parts[1].split()[0].strip()
+                    if synset.startswith('n'):  # Verify it's a valid synset ID
+                        val_annotations[img_name] = synset
+    else:
+        print("Validation ground truth file not found!")
+        # Try to find val_loc.txt
+        val_loc = os.path.join(temp_dir, 'ImageSets', 'CLS-LOC', 'val_loc.txt')
+        if os.path.exists(val_loc):
+            print("Using val_loc.txt...")
+            with open(val_loc, 'r') as f:
+                for line in f:
+                    parts = line.strip().split()
+                    if len(parts) >= 2:
+                        img_name = parts[0]
+                        synset = parts[1]
+                        val_annotations[img_name] = synset
+        else:
+            raise FileNotFoundError("Could not find validation annotations!")
+
+    print(f"Found {len(val_annotations)} validation annotations")
+
+    # Create validation directory structure
+    print("Organizing validation images into class folders...")
+    val_path = os.path.join(data_root, 'val')
+    
+    # Create validation class directories
+    unique_synsets = set(val_annotations.values())
+    for synset in unique_synsets:
+        os.makedirs(os.path.join(val_dir, synset), exist_ok=True)
+
+    # Copy validation images to their respective class folders
+    missing_images = []
+    for img_name, synset in tqdm(val_annotations.items()):
+        # Try different possible image extensions
+        found = False
+        for ext in ['.JPEG', '.jpeg', '.jpg']:
+            src_path = os.path.join(val_path, img_name + ext)
+            if os.path.exists(src_path):
+                dst_dir = os.path.join(val_dir, synset)
+                dst_path = os.path.join(dst_dir, img_name + ext)
+                try:
+                    shutil.copy2(src_path, dst_path)
+                    found = True
+                    break
+                except Exception as e:
+                    print(f"Error copying {src_path}: {e}")
+        
+        if not found:
+            missing_images.append(img_name)
+
+    if missing_images:
+        print(f"Warning: Could not find {len(missing_images)} validation images")
+        print("First few missing images:", missing_images[:5])
+
+    # Verify validation data structure
+    print("\nVerifying validation data structure...")
+    val_classes = os.listdir(val_dir)
+    print(f"Number of validation classes: {len(val_classes)}")
+    
+    class_counts = {}
+    for class_dir in val_classes:
+        class_path = os.path.join(val_dir, class_dir)
+        if os.path.isdir(class_path):
+            count = len(os.listdir(class_path))
+            class_counts[class_dir] = count
+    
+    total_val_images = sum(class_counts.values())
+    print(f"Total validation images: {total_val_images}")
+    
+    # Print distribution statistics
+    counts = list(class_counts.values())
+    if counts:
+        print(f"Images per class - Min: {min(counts)}, Max: {max(counts)}, "
+              f"Average: {sum(counts)/len(counts):.1f}")
+        
+        # Print classes with very few images
+        small_classes = {k: v for k, v in class_counts.items() if v < 10}
+        if small_classes:
+            print("\nWarning: Classes with less than 10 images:")
+            for cls, count in small_classes.items():
+                print(f"{cls}: {count} images")
+
+    # Print dataset statistics
+    print("\nDataset Statistics:")
+    print(f"Number of training classes: {len(os.listdir(train_dir))}")
+    print(f"Number of validation classes: {len(os.listdir(val_dir))}")
+    
+    train_samples = sum(len(os.listdir(os.path.join(train_dir, d))) 
+                       for d in os.listdir(train_dir))
+    val_samples = sum(len(os.listdir(os.path.join(val_dir, d))) 
+                     for d in os.listdir(val_dir))
+    
+    print(f"Total training samples: {train_samples}")
+    print(f"Total validation samples: {val_samples}")
+    
+    # Create tar archives of processed data
+    print("\nCreating tar archives of processed data...")
+    subprocess.run(['tar', '-cf', f'{train_dir}.tar', '-C', cache_dir, 'train'])
+    subprocess.run(['tar', '-cf', f'{val_dir}.tar', '-C', cache_dir, 'val'])
+    
+    # Upload processed data to S3 if handler provided
+    if s3_handler:
+        print("Uploading processed data to S3...")
+        s3_handler.upload_model(f'{train_dir}.tar', 'processed_data/train.tar')
+        s3_handler.upload_model(f'{val_dir}.tar', 'processed_data/val.tar')
+    
+    # Clean up temporary directory
+    shutil.rmtree(temp_dir)
+    
+    print("\nDataset preparation completed!")
     
     return train_dir, val_dir
 
 def write_ffcv_dataset(data_dir, write_path):
-    """Convert dataset to FFCV format"""
+    """Convert dataset to FFCV format with optimizations for ImageNet"""
     print(f"Converting {data_dir} to FFCV format...")
-    dataset = ImageFolder(data_dir)
-    writer = DatasetWriter(write_path, {
-        'image': RGBImageField(
-            max_resolution=256,
-            jpeg_quality=95
-        ),
-        'label': IntField()
-    }, num_workers=8)
     
-    # Convert PIL Images to numpy arrays with progress bar
+    # Verify directory structure
+    if not os.path.isdir(data_dir):
+        raise ValueError(f"Data directory {data_dir} does not exist")
+    
+    # Check for class directories
+    class_dirs = [d for d in os.listdir(data_dir) 
+                 if os.path.isdir(os.path.join(data_dir, d))]
+    
+    if not class_dirs:
+        raise ValueError(f"No class directories found in {data_dir}")
+    
+    print(f"Found {len(class_dirs)} classes")
+    
+    # Verify each class has images
+    empty_classes = []
+    for class_dir in class_dirs:
+        class_path = os.path.join(data_dir, class_dir)
+        if not os.listdir(class_path):
+            empty_classes.append(class_dir)
+    
+    if empty_classes:
+        raise ValueError(f"Found {len(empty_classes)} empty classes: {empty_classes}")
+    
+    # Create ImageFolder dataset
+    try:
+        dataset = ImageFolder(data_dir)
+    except Exception as e:
+        raise ValueError(f"Error creating ImageFolder dataset: {str(e)}")
+    
+    print(f"Dataset size: {len(dataset)} images")
+    
+    # Configure FFCV writer
+    writer = DatasetWriter(
+        write_path, 
+        {
+            'image': RGBImageField(
+                max_resolution=256,
+                jpeg_quality=95
+            ),
+            'label': IntField()
+        },
+        num_workers=min(32, os.cpu_count())
+    )
+    
+    # Write dataset with progress bar and error handling
     total = len(dataset)
-    with tqdm(total=total, desc="Writing FFCV dataset") as pbar:
-        writer.from_indexed_dataset(dataset)
-        pbar.update(total)
+    try:
+        with tqdm(total=total, desc="Writing FFCV dataset") as pbar:
+            writer.from_indexed_dataset(
+                dataset,
+                chunksize=100,
+                shuffle_indices=True
+            )
+            pbar.update(total)
+    except Exception as e:
+        # Clean up partial write
+        if os.path.exists(write_path):
+            os.remove(write_path)
+        raise ValueError(f"Error writing FFCV dataset: {str(e)}")
 
 def setup_ddp(rank, world_size):
     """Initialize distributed training"""
@@ -146,8 +350,8 @@ def setup_ddp(rank, world_size):
     dist.init_process_group("nccl", rank=rank, world_size=world_size)
     torch.cuda.set_device(rank)
 
-def create_ffcv_loaders(train_path, val_path, batch_size=512, rank=0, world_size=1):
-    """Create FFCV data loaders with DDP support"""
+def create_ffcv_loaders(train_path, val_path, batch_size=1024, rank=0, world_size=1):
+    """Create FFCV data loaders optimized for g6.12xlarge"""
     IMAGENET_MEAN = np.array([0.485, 0.456, 0.406]) * 255.0
     IMAGENET_STD = np.array([0.229, 0.224, 0.225]) * 255.0
     
@@ -161,7 +365,8 @@ def create_ffcv_loaders(train_path, val_path, batch_size=512, rank=0, world_size
         ToTensor(),
         ToDevice(device, non_blocking=True),
         ToTorchImage(channels_last=True),
-        NormalizeImage(IMAGENET_MEAN, IMAGENET_STD, np.float32)
+        Convert(torch.float16),  # Convert to float16
+        NormalizeImage(IMAGENET_MEAN, IMAGENET_STD, np.float16)  # Use float16 normalization
     ]
 
     val_image_pipeline = [
@@ -169,7 +374,8 @@ def create_ffcv_loaders(train_path, val_path, batch_size=512, rank=0, world_size
         ToTensor(),
         ToDevice(device, non_blocking=True),
         ToTorchImage(channels_last=True),
-        NormalizeImage(IMAGENET_MEAN, IMAGENET_STD, np.float32)
+        Convert(torch.float16),  # Convert to float16
+        NormalizeImage(IMAGENET_MEAN, IMAGENET_STD, np.float16)  # Use float16 normalization
     ]
 
     label_pipeline = [
@@ -179,56 +385,96 @@ def create_ffcv_loaders(train_path, val_path, batch_size=512, rank=0, world_size
         Convert(torch.long)
     ]
     
-    # Adjust batch size per GPU
-    per_gpu_batch_size = batch_size // world_size if world_size > 1 else batch_size
+    # Optimize batch size per GPU (1024/4 = 256 per GPU)
+    per_gpu_batch_size = batch_size // world_size
+    
+    # Optimize workers for g6.12xlarge (48 vCPUs / 4 GPUs = 12 workers per GPU)
+    num_workers = 12
     
     train_loader = Loader(
         train_path,
         batch_size=per_gpu_batch_size,
-        num_workers=4,
+        num_workers=num_workers,
         order=OrderOption.RANDOM,
         drop_last=True,
         pipelines={
             'image': train_image_pipeline,
             'label': label_pipeline
         },
-        os_cache=False
+        os_cache=True,
+        distributed=world_size > 1,  # Enable distributed training
+        seed=42,  # Set seed for reproducibility
     )
     
     val_loader = Loader(
         val_path,
         batch_size=per_gpu_batch_size,
-        num_workers=4,
+        num_workers=num_workers,  # Updated number of workers
         order=OrderOption.SEQUENTIAL,
         drop_last=False,
         pipelines={
             'image': val_image_pipeline,
             'label': label_pipeline
         },
-        os_cache=False
+        os_cache=True  # Enable OS cache for better performance
     )
     
     return train_loader, val_loader
 
-def train_model(rank, world_size, train_loader, val_loader, s3_handler, num_epochs=10, resume_path=None, save_freq=2, patience=3):
-    """Train model with DDP support"""
+def train_model(rank, world_size, train_loader, val_loader, s3_handler, num_epochs=40, resume_path=None, save_freq=10, patience=3):
+    """Train model with optimizations for g6.12xlarge"""
+    logger = logging.getLogger('training')
+    
     setup_ddp(rank, world_size)
     
-    # Rest of the setup remains similar, but move model to specific GPU
+    # Enable cuDNN benchmarking for optimal performance
+    torch.backends.cudnn.benchmark = True
+    torch.backends.cudnn.deterministic = False
+    
+    # Use channels last memory format for better performance on NVIDIA A10G
     model = models.resnet50(weights=None)
     model = model.to(rank)
     model = model.to(memory_format=torch.channels_last)
     
-    # Wrap model with DDP
-    model = DDP(model, device_ids=[rank])
+    if world_size > 1:
+        # Configure DDP for better performance
+        model = DDP(model, 
+                   device_ids=[rank],
+                   find_unused_parameters=False,  # Disable unused parameter detection
+                   broadcast_buffers=False)  # Disable buffer broadcasting
     
-    scaler = torch.amp.GradScaler(device=f'cuda:{rank}')
-    criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
+    # Optimize gradient scaler for A10G GPUs
+    scaler = GradScaler(
+        init_scale=2**16,
+        growth_factor=2,
+        backoff_factor=0.5,
+        growth_interval=2000,
+        enabled=True
+    )
+    
+    # Use SGD with Nesterov momentum for better convergence
     optimizer = torch.optim.SGD(
-        model.parameters(), 
-        lr=TRAINING_CONFIG.get('learning_rate', 0.1),  # Use found LR or default to 0.1
-        momentum=0.9, 
-        weight_decay=1e-4
+        model.parameters(),
+        lr=TRAINING_CONFIG['learning_rate'],
+        momentum=0.9,
+        weight_decay=1e-4,
+        nesterov=True
+    )
+    
+    # Add gradient clipping
+    torch.nn.utils.clip_grad_norm_(model.parameters(), 
+                                 TRAINING_CONFIG['gradient_clip_val'])
+    
+    # Use OneCycleLR with warmup
+    steps_per_epoch = len(train_loader)
+    scheduler = OneCycleLR(
+        optimizer,
+        max_lr=TRAINING_CONFIG['learning_rate'],
+        epochs=num_epochs,
+        steps_per_epoch=steps_per_epoch,
+        pct_start=TRAINING_CONFIG['warmup_epochs'] / num_epochs,
+        div_factor=25,
+        final_div_factor=1e4
     )
     
     # Initialize variables for training
@@ -248,14 +494,24 @@ def train_model(rank, world_size, train_loader, val_loader, s3_handler, num_epoc
         best_acc = checkpoint.get('best_acc', 0.0)
         print(f"Resuming from epoch {start_epoch} with best accuracy: {best_acc:.2f}%")
     
-    scheduler = OneCycleLR(optimizer, max_lr=0.1, epochs=num_epochs,
-                          steps_per_epoch=len(train_loader))
-    
     model.train()
     model.requires_grad_(True)
     
+    # Log training configuration
+    logger.info(f"Training Configuration:")
+    logger.info(f"Mixed Precision: Enabled (AMP with float16)")
+    logger.info(f"Number of GPUs: {world_size}")
+    logger.info(f"Batch size per GPU: {TRAINING_CONFIG['batch_size'] // world_size}")
+    logger.info(f"Total batch size: {TRAINING_CONFIG['batch_size']}")
+    logger.info(f"Number of workers per GPU: {TRAINING_CONFIG['num_workers']}")
+    
+    # Track AMP scaling stats
+    amp_stats = {
+        'overflow_count': 0,
+        'scale': scaler.get_scale()
+    }
+    
     for epoch in range(start_epoch, num_epochs):
-        # Training
         model.train()
         train_loss = 0
         correct = 0
@@ -265,15 +521,26 @@ def train_model(rank, world_size, train_loader, val_loader, s3_handler, num_epoc
         for i, (images, labels) in enumerate(pbar):
             if i % 10 == 0:
                 torch.cuda.empty_cache()
+                current_scale = scaler.get_scale()
+                if current_scale != amp_stats['scale']:
+                    logger.info(f"AMP scale changed: {amp_stats['scale']} → {current_scale}")
+                    amp_stats['scale'] = current_scale
             
             labels = labels.squeeze()
-                
-            with torch.amp.autocast('cuda'):
+            
+            # Mixed precision training
+            with autocast(device_type='cuda', dtype=torch.float16):
                 outputs = model(images)
                 loss = criterion(outputs, labels)
             
+            # Scale loss and perform backward pass
             scaler.scale(loss).backward()
-            scaler.step(optimizer)
+            
+            # Check for overflow (gradient scaling)
+            if not scaler.step(optimizer):
+                amp_stats['overflow_count'] += 1
+                logger.warning(f"Gradient overflow detected (count: {amp_stats['overflow_count']})")
+            
             scaler.update()
             optimizer.zero_grad(set_to_none=True)
             scheduler.step()
@@ -288,6 +555,25 @@ def train_model(rank, world_size, train_loader, val_loader, s3_handler, num_epoc
                 'acc': f'{100.*correct/total:.2f}%'
             })
         
+        # Log epoch statistics
+        epoch_stats = {
+            'epoch': epoch + 1,
+            'train_loss': train_loss / len(train_loader),
+            'train_acc': 100. * correct / total,
+            'amp_scale': scaler.get_scale(),
+            'amp_overflow_count': amp_stats['overflow_count'],
+            'learning_rate': optimizer.param_groups[0]['lr']
+        }
+        
+        logger.info(
+            f"Epoch {epoch_stats['epoch']}/{num_epochs} - "
+            f"Train Loss: {epoch_stats['train_loss']:.4f} - "
+            f"Train Acc: {epoch_stats['train_acc']:.2f}% - "
+            f"LR: {epoch_stats['learning_rate']:.6f} - "
+            f"AMP Scale: {epoch_stats['amp_scale']} - "
+            f"Overflow Count: {epoch_stats['amp_overflow_count']}"
+        )
+        
         # Validation
         model.eval()
         val_loss = 0
@@ -295,7 +581,7 @@ def train_model(rank, world_size, train_loader, val_loader, s3_handler, num_epoc
         total = 0
         
         val_pbar = tqdm(val_loader, desc=f'Epoch {epoch+1}/{num_epochs} [Val]')
-        with torch.no_grad():
+        with torch.no_grad(), autocast(device_type='cuda', dtype=torch.float16):
             for images, labels in val_pbar:
                 labels = labels.squeeze()
                 
@@ -346,6 +632,19 @@ def train_model(rank, world_size, train_loader, val_loader, s3_handler, num_epoc
         if patience_counter >= patience:
             print(f'\nEarly stopping triggered after {epoch + 1} epochs')
             break
+        
+        # Upload logs to S3 periodically
+        if (epoch + 1) % save_freq == 0:
+            log_files = [f for f in os.listdir('.') if f.endswith('.log')]
+            for log_file in log_files:
+                s3_handler.upload_model(
+                    log_file, 
+                    f'training_logs/{log_file}'
+                )
+        
+        # Log GPU memory usage
+        if rank == 0:  # Only log from main process
+            log_gpu_memory_stats(logger, rank)
     
     # Save final model
     torch.save(checkpoint, 'final_model.pth')
@@ -406,52 +705,114 @@ def find_lr(model, train_loader, criterion, device):
     
     return suggested_lr
 
+def setup_logging():
+    """Configure logging to both file and console"""
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    log_file = f'training_{timestamp}.log'
+    
+    # Create formatter
+    formatter = logging.Formatter(
+        '%(asctime)s - %(levelname)s - %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
+    )
+    
+    # Setup file handler
+    file_handler = logging.FileHandler(log_file)
+    file_handler.setFormatter(formatter)
+    
+    # Setup console handler
+    console_handler = logging.StreamHandler()
+    console_handler.setFormatter(formatter)
+    
+    # Setup logger
+    logger = logging.getLogger('training')
+    logger.setLevel(logging.INFO)
+    logger.addHandler(file_handler)
+    logger.addHandler(console_handler)
+    
+    return logger
+
+def log_gpu_memory_stats(logger, rank):
+    """Log GPU memory usage"""
+    if torch.cuda.is_available():
+        memory_allocated = torch.cuda.memory_allocated(rank) / 1024**2
+        memory_reserved = torch.cuda.memory_reserved(rank) / 1024**2
+        max_memory_allocated = torch.cuda.max_memory_allocated(rank) / 1024**2
+        
+        logger.info(
+            f"GPU:{rank} Memory (MB) - "
+            f"Allocated: {memory_allocated:.1f} - "
+            f"Reserved: {memory_reserved:.1f} - "
+            f"Peak: {max_memory_allocated:.1f}"
+        )
+
 def main():
     try:
         # Print system information
         print_system_info()
 
+        # Create data directory
+        os.makedirs('data', exist_ok=True)
+        cache_dir = os.path.join('data', 'processed_cache')
+        os.makedirs(cache_dir, exist_ok=True)
+
         # Initialize S3 handler
         s3_handler = S3Handler()
 
-        # Add checkpoint handling
-        resume_checkpoint = None
-        if len(sys.argv) > 1 and sys.argv[1] == '--resume':
-            if len(sys.argv) > 2:
-                checkpoint_path = sys.argv[2]
-                # Download checkpoint from S3 if it starts with 's3://'
-                if checkpoint_path.startswith('s3://'):
-                    local_checkpoint_path = 'downloaded_checkpoint.pth'
-                    # Extract bucket and key from s3:// URL
-                    _, _, bucket_key = checkpoint_path.partition('s3://')
-                    bucket, key = bucket_key.split('/', 1)
-                    print(f"Downloading checkpoint from S3: {checkpoint_path}")
-                    s3_handler.s3.download_file(bucket, key, local_checkpoint_path)
-                    resume_checkpoint = local_checkpoint_path
-                else:
-                    resume_checkpoint = checkpoint_path
-                print(f"Resuming from checkpoint: {resume_checkpoint}")
-            else:
-                print("Error: Please provide checkpoint path when using --resume")
-                return
+        # Check if FFCV files exist locally or in S3
+        if not os.path.exists('train.beton') or not os.path.exists('val.beton'):
+            try:
+                # Try to download pre-processed FFCV files from S3 first
+                print("Checking for FFCV files in S3...")
+                s3_handler.download_dataset('processed_data/train.beton', 'train.beton')
+                s3_handler.download_dataset('processed_data/val.beton', 'val.beton')
+                print("Successfully downloaded FFCV files from S3")
+            except Exception as e:
+                print(f"FFCV files not found in S3 or error downloading: {e}")
+                print("Will process dataset from scratch or cached tar files...")
 
-        # Rest of your existing setup code...
+                # Try to use cached processed data or download original dataset
+                train_dir = os.path.join(cache_dir, 'train')
+                val_dir = os.path.join(cache_dir, 'val')
+
+                if not (os.path.exists(train_dir) and os.path.exists(val_dir)):
+                    try:
+                        # Try to download and extract cached tar files
+                        print("Attempting to download cached tar files...")
+                        s3_handler.download_dataset('processed_data/train.tar', f'{train_dir}.tar')
+                        s3_handler.download_dataset('processed_data/val.tar', f'{val_dir}.tar')
+                        
+                        print("Extracting cached tar files...")
+                        subprocess.run(['tar', '-xf', f'{train_dir}.tar', '-C', cache_dir])
+                        subprocess.run(['tar', '-xf', f'{val_dir}.tar', '-C', cache_dir])
+                    except Exception as e:
+                        print(f"No cached tar files found or error: {e}")
+                        # If no cached data, process from scratch
+                        dataset_path = os.path.join('data', 'dataset.zip')
+                        if not os.path.exists(dataset_path):
+                            s3_handler.download_dataset('raraw-data/imagenet-object-localization-challenge.zip', dataset_path)
+                        train_dir, val_dir = prepare_data(dataset_path, 'data', s3_handler)
+
+                # Create FFCV files from processed data
+                print("\nCreating FFCV files from processed data...")
+                write_ffcv_dataset(train_dir, 'train.beton')
+                write_ffcv_dataset(val_dir, 'val.beton')
+                
+                # Upload FFCV files to S3
+                print("Uploading FFCV files to S3...")
+                s3_handler.upload_model('train.beton', 'processed_data/train.beton')
+                s3_handler.upload_model('val.beton', 'processed_data/val.beton')
+
+        # Start training
         if not torch.cuda.is_available():
             print("CUDA is not available. Running on CPU only.")
             return
 
         gpu_count = torch.cuda.device_count()
-        # ... (your existing GPU info printing code)
-
-        # Download and prepare data if not already present
-        if not os.path.exists('train.beton') or not os.path.exists('val.beton'):
-            s3_handler.download_dataset('train_archive.zip', 'dataset.zip')
-            train_dir, val_dir = prepare_data('dataset.zip', 'data')
-            write_ffcv_dataset(train_dir, 'train.beton')
-            write_ffcv_dataset(val_dir, 'val.beton')
+        print(f"\nFound {gpu_count} GPUs!")
 
         if gpu_count > 1:
-            print(f"Multiple GPUs detected! Using DistributedDataParallel across {gpu_count} GPUs.")
+            print(f"Using DistributedDataParallel across {gpu_count} GPUs")
             mp.spawn(
                 train_model,
                 args=(
@@ -460,7 +821,7 @@ def main():
                     'val.beton',
                     s3_handler,
                     TRAINING_CONFIG['num_epochs'],
-                    resume_checkpoint,  # Pass the checkpoint path
+                    None,  # resume_path
                     2,     # save_freq
                     3      # patience
                 ),
@@ -468,7 +829,7 @@ def main():
                 join=True
             )
         else:
-            print("Single GPU detected. Running without distributed training.")
+            print("Running on single GPU")
             
             # Create model and move to GPU
             model = models.resnet50(weights=None)
@@ -482,20 +843,19 @@ def main():
                 batch_size=TRAINING_CONFIG['batch_size']
             )
             
-            # Add LR finder before training if not resuming
-            if resume_checkpoint is None:
-                criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
-                suggested_lr = find_lr(model, train_loader, criterion, device=torch.device('cuda:0'))
-                print(f"Suggested learning rate: {suggested_lr}")
-                
-                # Upload the LR finder plot to S3
-                if os.path.exists('lr_finder_plot.png'):
-                    s3_handler.upload_model('lr_finder_plot.png', 'training_artifacts/lr_finder_plot.png')
-                
-                # Update the learning rate in your training configuration
-                TRAINING_CONFIG['learning_rate'] = suggested_lr
+            # Add LR finder before training
+            criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
+            suggested_lr = find_lr(model, train_loader, criterion, device=torch.device('cuda:0'))
+            print(f"Suggested learning rate: {suggested_lr}")
             
-            # Continue with your existing training code...
+            # Upload the LR finder plot to S3
+            if os.path.exists('lr_finder_plot.png'):
+                s3_handler.upload_model('lr_finder_plot.png', 'training_artifacts/lr_finder_plot.png')
+            
+            # Update the learning rate in your training configuration
+            TRAINING_CONFIG['learning_rate'] = suggested_lr
+            
+            # Start training
             train_model(
                 0,              # rank
                 1,              # world_size
@@ -503,18 +863,20 @@ def main():
                 val_loader,
                 s3_handler,
                 num_epochs=TRAINING_CONFIG['num_epochs'],
-                resume_path=resume_checkpoint,
+                resume_path=None,
                 save_freq=2,
                 patience=3
             )
 
     finally:
-        # Cleanup temporary files
+        # Cleanup temporary files but keep the FFCV files
         for file in ['dataset.zip', 'downloaded_checkpoint.pth', 'lr_finder_plot.png']:
             if os.path.exists(file):
                 os.remove(file)
-        if os.path.exists('data'):
+        # Only remove the data directory if FFCV files were successfully created
+        if os.path.exists('train.beton') and os.path.exists('val.beton') and os.path.exists('data'):
             shutil.rmtree('data')
 
 if __name__ == '__main__':
+    logger = setup_logging()
     main() 
