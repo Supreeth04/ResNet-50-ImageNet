@@ -13,7 +13,7 @@ from ffcv.transforms import ToTensor, ToDevice, RandomHorizontalFlip
 from ffcv.transforms import NormalizeImage, RandomResizedCrop
 from ffcv.writer import DatasetWriter
 from torchvision.datasets import ImageFolder
-from torch.cuda.amp import autocast, GradScaler
+from torch.amp import autocast, GradScaler
 from torch.optim.lr_scheduler import OneCycleLR
 import torchvision.models as models
 from tqdm import tqdm
@@ -347,8 +347,20 @@ def setup_ddp(rank, world_size):
     """Initialize distributed training"""
     os.environ['MASTER_ADDR'] = 'localhost'
     os.environ['MASTER_PORT'] = '12355'
-    dist.init_process_group("nccl", rank=rank, world_size=world_size)
+    
+    # Initialize process group
+    dist.init_process_group(
+        backend="nccl",
+        init_method="env://",
+        world_size=world_size,
+        rank=rank
+    )
+    
+    # Set device
     torch.cuda.set_device(rank)
+    
+    # Ensure all processes are ready
+    dist.barrier()
 
 def create_ffcv_loaders(train_path, val_path, batch_size=1024, rank=0, world_size=1):
     """Create FFCV data loaders optimized for g6.12xlarge"""
@@ -365,8 +377,8 @@ def create_ffcv_loaders(train_path, val_path, batch_size=1024, rank=0, world_siz
         ToTensor(),
         ToDevice(device, non_blocking=True),
         ToTorchImage(channels_last=True),
-        Convert(torch.float16),  # Convert to float16
-        NormalizeImage(IMAGENET_MEAN, IMAGENET_STD, np.float16)  # Use float16 normalization
+        NormalizeImage(IMAGENET_MEAN, IMAGENET_STD, np.float32),  # Normalize in fp32 first
+        Convert(torch.float16)  # Convert to fp16 after normalization
     ]
 
     val_image_pipeline = [
@@ -374,8 +386,8 @@ def create_ffcv_loaders(train_path, val_path, batch_size=1024, rank=0, world_siz
         ToTensor(),
         ToDevice(device, non_blocking=True),
         ToTorchImage(channels_last=True),
-        Convert(torch.float16),  # Convert to float16
-        NormalizeImage(IMAGENET_MEAN, IMAGENET_STD, np.float16)  # Use float16 normalization
+        NormalizeImage(IMAGENET_MEAN, IMAGENET_STD, np.float32),  # Normalize in fp32 first
+        Convert(torch.float16)  # Convert to fp16 after normalization
     ]
 
     label_pipeline = [
@@ -402,39 +414,55 @@ def create_ffcv_loaders(train_path, val_path, batch_size=1024, rank=0, world_siz
             'label': label_pipeline
         },
         os_cache=True,
-        distributed=world_size > 1,  # Enable distributed training
-        seed=42,  # Set seed for reproducibility
+        distributed=world_size > 1,
+        seed=42
     )
     
     val_loader = Loader(
         val_path,
         batch_size=per_gpu_batch_size,
-        num_workers=num_workers,  # Updated number of workers
+        num_workers=num_workers,
         order=OrderOption.SEQUENTIAL,
         drop_last=False,
         pipelines={
             'image': val_image_pipeline,
             'label': label_pipeline
         },
-        os_cache=True  # Enable OS cache for better performance
+        os_cache=True
     )
     
     return train_loader, val_loader
 
-def train_model(rank, world_size, train_loader, val_loader, s3_handler, num_epochs=40, resume_path=None, save_freq=10, patience=3):
+def train_model(rank, world_size, train_path, val_path, num_epochs=40, resume_path=None, save_freq=2, patience=3):
     """Train model with optimizations for g6.12xlarge"""
-    logger = logging.getLogger('training')
-    
+    # Initialize process group first
     setup_ddp(rank, world_size)
+    
+    # Create S3 handler inside the process
+    s3_handler = S3Handler()
+    
+    # Create data loaders after DDP setup
+    train_loader, val_loader = create_ffcv_loaders(
+        train_path, 
+        val_path, 
+        batch_size=TRAINING_CONFIG['batch_size'],
+        rank=rank,
+        world_size=world_size
+    )
+    
+    logger = logging.getLogger('training')
     
     # Enable cuDNN benchmarking for optimal performance
     torch.backends.cudnn.benchmark = True
     torch.backends.cudnn.deterministic = False
     
-    # Use channels last memory format for better performance on NVIDIA A10G
+    # Create model
     model = models.resnet50(weights=None)
     model = model.to(rank)
     model = model.to(memory_format=torch.channels_last)
+    
+    # Create criterion here
+    criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
     
     if world_size > 1:
         # Configure DDP for better performance
@@ -443,13 +471,14 @@ def train_model(rank, world_size, train_loader, val_loader, s3_handler, num_epoc
                    find_unused_parameters=False,  # Disable unused parameter detection
                    broadcast_buffers=False)  # Disable buffer broadcasting
     
-    # Optimize gradient scaler for A10G GPUs
+    # Update GradScaler initialization
     scaler = GradScaler(
+        enabled=True,
         init_scale=2**16,
         growth_factor=2,
         backoff_factor=0.5,
         growth_interval=2000,
-        enabled=True
+        device='cuda'  # Specify device explicitly
     )
     
     # Use SGD with Nesterov momentum for better convergence
@@ -528,15 +557,14 @@ def train_model(rank, world_size, train_loader, val_loader, s3_handler, num_epoc
             
             labels = labels.squeeze()
             
-            # Mixed precision training
-            with autocast(device_type='cuda', dtype=torch.float16):
+            # Update autocast usage
+            with torch.amp.autocast(device_type='cuda', dtype=torch.float16, enabled=True):
                 outputs = model(images)
                 loss = criterion(outputs, labels)
             
-            # Scale loss and perform backward pass
+            # Rest of training loop remains the same
             scaler.scale(loss).backward()
             
-            # Check for overflow (gradient scaling)
             if not scaler.step(optimizer):
                 amp_stats['overflow_count'] += 1
                 logger.warning(f"Gradient overflow detected (count: {amp_stats['overflow_count']})")
@@ -581,22 +609,23 @@ def train_model(rank, world_size, train_loader, val_loader, s3_handler, num_epoc
         total = 0
         
         val_pbar = tqdm(val_loader, desc=f'Epoch {epoch+1}/{num_epochs} [Val]')
-        with torch.no_grad(), autocast(device_type='cuda', dtype=torch.float16):
-            for images, labels in val_pbar:
-                labels = labels.squeeze()
-                
-                outputs = model(images)
-                loss = criterion(outputs, labels)
-                
-                val_loss += loss.item()
-                _, predicted = outputs.max(1)
-                total += labels.size(0)
-                correct += predicted.eq(labels).sum().item()
-                
-                val_pbar.set_postfix({
-                    'loss': val_loss/(total/labels.size(0)), 
-                    'acc': f'{100.*correct/total:.2f}%'
-                })
+        with torch.no_grad():
+            with torch.amp.autocast(device_type='cuda', dtype=torch.float16, enabled=True):
+                for images, labels in val_pbar:
+                    labels = labels.squeeze()
+                    
+                    outputs = model(images)
+                    loss = criterion(outputs, labels)
+                    
+                    val_loss += loss.item()
+                    _, predicted = outputs.max(1)
+                    total += labels.size(0)
+                    correct += predicted.eq(labels).sum().item()
+                    
+                    val_pbar.set_postfix({
+                        'loss': val_loss/(total/labels.size(0)), 
+                        'acc': f'{100.*correct/total:.2f}%'
+                    })
         
         val_acc = 100.*correct/total
         avg_val_loss = val_loss/len(val_loader)
@@ -756,9 +785,6 @@ def main():
         cache_dir = os.path.join('data', 'processed_cache')
         os.makedirs(cache_dir, exist_ok=True)
 
-        # Initialize S3 handler
-        s3_handler = S3Handler()
-
         # Check if FFCV files exist locally or in S3
         if not os.path.exists('train.beton') or not os.path.exists('val.beton'):
             try:
@@ -813,21 +839,27 @@ def main():
 
         if gpu_count > 1:
             print(f"Using DistributedDataParallel across {gpu_count} GPUs")
-            mp.spawn(
-                train_model,
-                args=(
-                    gpu_count,
-                    'train.beton',
-                    'val.beton',
-                    s3_handler,
-                    TRAINING_CONFIG['num_epochs'],
-                    None,  # resume_path
-                    2,     # save_freq
-                    3      # patience
-                ),
-                nprocs=gpu_count,
-                join=True
-            )
+            try:
+                mp.spawn(
+                    train_model,
+                    args=(
+                        gpu_count,
+                        'train.beton',
+                        'val.beton',
+                        TRAINING_CONFIG['num_epochs'],
+                        None,  # resume_path
+                        2,     # save_freq
+                        3      # patience
+                    ),
+                    nprocs=gpu_count,
+                    join=True
+                )
+            except Exception as e:
+                print(f"Error in DDP training: {str(e)}")
+                # Clean up in case of error
+                if dist.is_initialized():
+                    dist.destroy_process_group()
+                raise
         else:
             print("Running on single GPU")
             
@@ -848,6 +880,8 @@ def main():
             suggested_lr = find_lr(model, train_loader, criterion, device=torch.device('cuda:0'))
             print(f"Suggested learning rate: {suggested_lr}")
             
+            s3_handler = S3Handler()  # Create S3 handler here for single GPU case
+            
             # Upload the LR finder plot to S3
             if os.path.exists('lr_finder_plot.png'):
                 s3_handler.upload_model('lr_finder_plot.png', 'training_artifacts/lr_finder_plot.png')
@@ -859,9 +893,8 @@ def main():
             train_model(
                 0,              # rank
                 1,              # world_size
-                train_loader,
-                val_loader,
-                s3_handler,
+                'train.beton',
+                'val.beton',
                 num_epochs=TRAINING_CONFIG['num_epochs'],
                 resume_path=None,
                 save_freq=2,
