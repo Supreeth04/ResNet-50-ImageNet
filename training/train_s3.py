@@ -443,7 +443,7 @@ def setup_ddp(rank, world_size):
     dist.barrier()
 
 def create_ffcv_loaders(train_path, val_path, batch_size=1024, rank=0, world_size=1):
-    """Create FFCV data loaders optimized for g6.12xlarge"""
+    """Create FFCV data loaders optimized for g6.12xlarge with L4 GPUs"""
     IMAGENET_MEAN = np.array([0.485, 0.456, 0.406]) * 255.0
     IMAGENET_STD = np.array([0.229, 0.224, 0.225]) * 255.0
     
@@ -457,8 +457,8 @@ def create_ffcv_loaders(train_path, val_path, batch_size=1024, rank=0, world_siz
         ToTensor(),
         ToDevice(device, non_blocking=True),
         ToTorchImage(channels_last=True),
-        NormalizeImage(IMAGENET_MEAN, IMAGENET_STD, np.float32),  # Normalize in fp32 first
-        Convert(torch.float16)  # Convert to fp16 after normalization
+        NormalizeImage(IMAGENET_MEAN, IMAGENET_STD, np.float32),
+        Convert(torch.float16)
     ]
 
     val_image_pipeline = [
@@ -466,8 +466,8 @@ def create_ffcv_loaders(train_path, val_path, batch_size=1024, rank=0, world_siz
         ToTensor(),
         ToDevice(device, non_blocking=True),
         ToTorchImage(channels_last=True),
-        NormalizeImage(IMAGENET_MEAN, IMAGENET_STD, np.float32),  # Normalize in fp32 first
-        Convert(torch.float16)  # Convert to fp16 after normalization
+        NormalizeImage(IMAGENET_MEAN, IMAGENET_STD, np.float32),
+        Convert(torch.float16)
     ]
 
     label_pipeline = [
@@ -480,8 +480,12 @@ def create_ffcv_loaders(train_path, val_path, batch_size=1024, rank=0, world_siz
     # Optimize batch size per GPU (1024/4 = 256 per GPU)
     per_gpu_batch_size = batch_size // world_size
     
-    # Optimize workers for g6.12xlarge (48 vCPUs / 4 GPUs = 12 workers per GPU)
-    num_workers = 12
+    # Calculate optimal number of workers for g6.12xlarge (48 cores, 4 GPUs)
+    # Reserve 2 cores for system processes and PyTorch overhead
+    available_cores = 46  # 48 - 2
+    num_workers = available_cores // world_size  # This gives us 11-12 workers per GPU
+    
+    print(f"Using {num_workers} workers per GPU for rank {rank}")
     
     train_loader = Loader(
         train_path,
@@ -495,7 +499,8 @@ def create_ffcv_loaders(train_path, val_path, batch_size=1024, rank=0, world_siz
         },
         os_cache=True,
         distributed=world_size > 1,
-        seed=42
+        seed=42,
+        num_threads_per_worker=1  # Explicitly set threads per worker
     )
     
     val_loader = Loader(
@@ -508,7 +513,9 @@ def create_ffcv_loaders(train_path, val_path, batch_size=1024, rank=0, world_siz
             'image': val_image_pipeline,
             'label': label_pipeline
         },
-        os_cache=True
+        os_cache=True,
+        distributed=world_size > 1,
+        num_threads_per_worker=1  # Explicitly set threads per worker
     )
     
     return train_loader, val_loader
@@ -869,55 +876,21 @@ def main():
     try:
         # Print system information
         print_system_info()
-
+        s3_handler = S3Handler()
+        
         # Create data directory
         os.makedirs('data', exist_ok=True)
-        cache_dir = os.path.join('data', 'processed_cache')
-        os.makedirs(cache_dir, exist_ok=True)
 
-        # Check if FFCV files exist locally or in S3
-        if not os.path.exists('train.beton') or not os.path.exists('val.beton'):
-            try:
-                # Try to download pre-processed FFCV files from S3 first
-                print("Checking for FFCV files in S3...")
-                s3_handler.download_dataset('processed_data/train.beton', 'train.beton')
-                s3_handler.download_dataset('processed_data/val.beton', 'val.beton')
-                print("Successfully downloaded FFCV files from S3")
-            except Exception as e:
-                print(f"FFCV files not found in S3 or error downloading: {e}")
-                print("Will process dataset from scratch or cached tar files...")
-
-                # Try to use cached processed data or download original dataset
-                train_dir = os.path.join(cache_dir, 'train')
-                val_dir = os.path.join(cache_dir, 'val')
-
-                if not (os.path.exists(train_dir) and os.path.exists(val_dir)):
-                    try:
-                        # Try to download and extract cached tar files
-                        print("Attempting to download cached tar files...")
-                        s3_handler.download_dataset('processed_data/train.tar', f'{train_dir}.tar')
-                        s3_handler.download_dataset('processed_data/val.tar', f'{val_dir}.tar')
-                        
-                        print("Extracting cached tar files...")
-                        subprocess.run(['tar', '-xf', f'{train_dir}.tar', '-C', cache_dir])
-                        subprocess.run(['tar', '-xf', f'{val_dir}.tar', '-C', cache_dir])
-                    except Exception as e:
-                        print(f"No cached tar files found or error: {e}")
-                        # If no cached data, process from scratch
-                        dataset_path = os.path.join('data', 'dataset.zip')
-                        if not os.path.exists(dataset_path):
-                            s3_handler.download_dataset('raraw-data/imagenet-object-localization-challenge.zip', dataset_path)
-                        train_dir, val_dir = prepare_data(dataset_path, 'data', s3_handler)
-
-                # Create FFCV files from processed data
-                print("\nCreating FFCV files from processed data...")
-                write_ffcv_dataset(train_dir, 'train.beton')
-                write_ffcv_dataset(val_dir, 'val.beton')
-                
-                # Upload FFCV files to S3
-                print("Uploading FFCV files to S3...")
-                s3_handler.upload_model('train.beton', 'processed_data/train.beton')
-                s3_handler.upload_model('val.beton', 'processed_data/val.beton')
+        # Download FFCV files from S3
+        print("Downloading FFCV files from S3...")
+        try:
+            # Download from the correct S3 paths
+            s3_handler.download_dataset('processed_data/train.beton', 'train.beton')
+            s3_handler.download_dataset('processed_data/val.beton', 'val.beton')
+            print("Successfully downloaded FFCV files from S3")
+        except Exception as e:
+            print(f"Error downloading FFCV files from S3: {e}")
+            raise  # Stop execution if we can't get the required files
 
         # Start training
         if not torch.cuda.is_available():
