@@ -443,7 +443,7 @@ def setup_ddp(rank, world_size):
     dist.barrier()
 
 def create_ffcv_loaders(train_path, val_path, batch_size=1024, rank=0, world_size=1):
-    """Create FFCV data loaders optimized for g6.12xlarge with L4 GPUs"""
+    """Create FFCV data loaders optimized for g6.12xlarge"""
     IMAGENET_MEAN = np.array([0.485, 0.456, 0.406]) * 255.0
     IMAGENET_STD = np.array([0.229, 0.224, 0.225]) * 255.0
     
@@ -457,8 +457,8 @@ def create_ffcv_loaders(train_path, val_path, batch_size=1024, rank=0, world_siz
         ToTensor(),
         ToDevice(device, non_blocking=True),
         ToTorchImage(channels_last=True),
-        NormalizeImage(IMAGENET_MEAN, IMAGENET_STD, np.float32),
-        Convert(torch.float16)
+        NormalizeImage(IMAGENET_MEAN, IMAGENET_STD, np.float32),  # Normalize in fp32 first
+        Convert(torch.float16)  # Convert to fp16 after normalization
     ]
 
     val_image_pipeline = [
@@ -466,8 +466,8 @@ def create_ffcv_loaders(train_path, val_path, batch_size=1024, rank=0, world_siz
         ToTensor(),
         ToDevice(device, non_blocking=True),
         ToTorchImage(channels_last=True),
-        NormalizeImage(IMAGENET_MEAN, IMAGENET_STD, np.float32),
-        Convert(torch.float16)
+        NormalizeImage(IMAGENET_MEAN, IMAGENET_STD, np.float32),  # Normalize in fp32 first
+        Convert(torch.float16)  # Convert to fp16 after normalization
     ]
 
     label_pipeline = [
@@ -480,12 +480,8 @@ def create_ffcv_loaders(train_path, val_path, batch_size=1024, rank=0, world_siz
     # Optimize batch size per GPU (1024/4 = 256 per GPU)
     per_gpu_batch_size = batch_size // world_size
     
-    # Calculate optimal number of workers for g6.12xlarge (48 cores, 4 GPUs)
-    # Reserve 2 cores for system processes and PyTorch overhead
-    available_cores = 46  # 48 - 2
-    num_workers = available_cores // world_size  # This gives us 11-12 workers per GPU
-    
-    print(f"Using {num_workers} workers per GPU for rank {rank}")
+    # Optimize workers for g6.12xlarge (48 vCPUs / 4 GPUs = 12 workers per GPU)
+    num_workers = 12
     
     train_loader = Loader(
         train_path,
@@ -499,8 +495,7 @@ def create_ffcv_loaders(train_path, val_path, batch_size=1024, rank=0, world_siz
         },
         os_cache=True,
         distributed=world_size > 1,
-        seed=42,
-        num_threads_per_worker=1  # Explicitly set threads per worker
+        seed=42
     )
     
     val_loader = Loader(
@@ -513,9 +508,7 @@ def create_ffcv_loaders(train_path, val_path, batch_size=1024, rank=0, world_siz
             'image': val_image_pipeline,
             'label': label_pipeline
         },
-        os_cache=True,
-        distributed=world_size > 1,
-        num_threads_per_worker=1  # Explicitly set threads per worker
+        os_cache=True
     )
     
     return train_loader, val_loader

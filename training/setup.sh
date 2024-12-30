@@ -74,3 +74,4 @@ sudo nvidia-smi -ac 1215,1410
 # Print installation status
 echo "Installation completed. Checking environment..."
 python -c "import torch; import ffcv; import apex; print('All required packages imported successfully')" 
+python train_s3.py
