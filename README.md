@@ -4,7 +4,7 @@ A high-performance distributed training pipeline for ImageNet using FFCV, optimi
 
 ## Overview
 
-This project implements a distributed training pipeline for ResNet-50 on ImageNet, with the following key features:
+This project implements a distributed training pipeline for ResNet-50 on ImageNet-1k, with the following key features:
 
 - Optimized for AWS g6.12xlarge instances (4x NVIDIA A10G GPUs)
 - Uses FFCV for high-speed data loading
@@ -139,17 +139,20 @@ python train_s3.py
 ## Troubleshooting
 
 1. **CUDA Out of Memory**
-
    - Reduce batch size
    - Enable gradient accumulation
    - Check GPU memory usage patterns
 2. **Slow Data Loading**
-
    - Verify FFCV installation
-   - Adjust number of workers
+   - Adjust the number of workers
    - Check disk I/O performance
 3. **S3 Issues**
-
    - Verify AWS credentials
    - Check S3 bucket permissions
    - Monitor network connectivity
+## Acknowledgments
+
+- FFCV Team
+- PyTorch Team
+- Thanks to contributor (Ravi Tej)
+- Thanks to Rohan for providing me enough credits to make this happen
